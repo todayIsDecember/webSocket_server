@@ -1,86 +1,118 @@
 import WebSocket from "ws";
 
-export interface PrivateMessage {
+interface PrivateMessageRequest {
   type: "PRIVATE_MESSAGE";
   message: string;
   messageId: string;
-  to: number;
+  recipientId: number;
+  senderName?: string;
 }
 
-export interface PublicMessage {
+interface PublicMessageRequest {
   type: "PUBLIC_MESSAGE";
-  room: number;
+  roomId: number;
   messageId: string;
   message: string;
+  senderName?: string;
 }
 
-export interface JoinRoom {
+export interface JoinRoomRequest {
   type: "JOIN_ROOM";
   roomId: number;
 }
 
-export interface LeaveRoom {
+interface LeaveRoomRequest {
   type: "LEAVE_ROOM";
   roomId: number;
 }
 
-export interface ExtendedWebSocket extends WebSocket {
+export interface UserWebSocket extends WebSocket {
   isAlive: boolean;
-  rooms: Set<number>;
-  user_id: number;
+  joinedRoomIds: Set<number>;
+  userId: number;
+  userName: string;
 }
 
-export interface MessageAck {
-  type: "MESSAGE_ACK";
-  message_id: string;
-  status: "ACCEPTED" | "DECLAINED";
+interface DeliveryAcknowledgment {
+  type: "DELIVERED_ACK";
+  messageId: string;
+  senderId: number;
 }
 
 export type ClientMessage =
-  | PrivateMessage
-  | PublicMessage
-  | JoinRoom
-  | LeaveRoom;
+  | PrivateMessageRequest
+  | PublicMessageRequest
+  | JoinRoomRequest
+  | LeaveRoomRequest
+  | DeliveryAcknowledgment;
 
-interface ErrorMessage {
+interface ErrorResponse {
   type: "ERROR";
   message: string;
 }
 
-interface SuccessMessage {
+interface SuccessResponse {
   type: "SUCCESS";
   message: string;
 }
 
-interface AckMessage {
+interface MessageAcknowledgment {
   type: "MESSAGE_ACK";
   messageId: string;
   status: "ACCEPTED" | "DECLAINED";
+  chatId: string;
+  sequenceNumber: number;
 }
 
-export type ServerResponse = ErrorMessage | SuccessMessage | AckMessage;
+interface MessageDelivered {
+  type: "MESSAGE_DELIVERED";
+  messageId: string;
+  recipientId: number;
+}
+export type ServerResponse =
+  | ErrorResponse
+  | SuccessResponse
+  | MessageAcknowledgment
+  | MessageDelivered;
 
-interface PublicMessageReceived {
+interface PublicMessageEvent {
   type: "PUBLIC_MESSAGE_RECEIVED";
   messageId: string;
-  from: number;
-  room: number;
+  senderId: number;
+  roomId: number;
   message: string;
+  senderName: string;
+  sequenceNumber: number;
+  chatId: string;
 }
 
-interface PrivateMessageReceived {
+interface PrivateMessageEvent {
   type: "PRIVATE_MESSAGE_RECEIVED";
   messageId: string;
-  from: number;
+  senderId: number;
   message: string;
+  senderName: string;
+  sequenceNumber: number;
+  chatId: string;
 }
 
-export type ServerEvent = PublicMessageReceived | PrivateMessageReceived;
+export interface PrivateMessageRecord {
+  messageId: string;
+  recipientId: number;
+  senderId: number;
+}
+
+export type ServerEvent = PublicMessageEvent | PrivateMessageEvent;
 
 export type ServerMessage = ServerEvent | ServerResponse;
 
 export interface IPendingMessage {
+  message: ClientMessage;
+  ackTimeout: ReturnType<typeof setTimeout>;
+  attemptNumber: number;
+}
+
+export interface MessageStorage {
   messageId: string;
-  message: string;
-  timeOut: ReturnType<typeof setTimeout>;
+  sequenceNumber: number;
 }

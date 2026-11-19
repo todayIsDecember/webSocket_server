@@ -1,52 +1,63 @@
 import WebSocket, { WebSocketServer } from "ws";
 import type {
-  ExtendedWebSocket,
+  UserWebSocket,
   ClientMessage,
   ServerResponse,
   ServerEvent,
+  PrivateMessageRecord,
+  MessageStorage,
 } from "./interfaces.js";
-import crypto from "node:crypto";
 
-const wss = new WebSocketServer({ port: 3000 });
-const clients = new Map<number, Set<WebSocket>>();
-const rooms = new Map<number, Set<number>>();
+const webSocketServer = new WebSocketServer({ port: 3000 });
+const userConnections = new Map<number, Set<WebSocket>>();
+const roomMembers = new Map<number, Set<number>>();
+const processedMessageIds = new Set<string>();
+const privateMessageRecords = new Map<string, PrivateMessageRecord>();
+const chatSequences = new Map<string, number>();
+const messageSequences = new Map<string, number>();
 
-wss.on("connection", (socket: ExtendedWebSocket, request) => {
+webSocketServer.on("connection", (clientSocket: UserWebSocket, request) => {
   if (!request.url) {
-    socket.close(1008, "Invalid URL");
+    clientSocket.close(1008, "Invalid URL");
     return;
   } else {
-    if (socket.readyState !== WebSocket.OPEN) {
+    if (clientSocket.readyState !== WebSocket.OPEN) {
       return;
     }
-    socket.isAlive = true;
-    socket.on("pong", () => {
-      socket.isAlive = true;
+    clientSocket.isAlive = true;
+    clientSocket.on("pong", () => {
+      clientSocket.isAlive = true;
     });
-    const url = new URL(request.url, "http://localhost:3000");
-    socket.user_id = Number(url.searchParams.get("userId"));
-    if (socket.user_id <= 0 || !Number.isSafeInteger(socket.user_id)) {
-      return socket.close(1008, "Invalid userId");
+    const requestUrl = new URL(request.url, "http://localhost:3000");
+    clientSocket.userId = Number(requestUrl.searchParams.get("userId"));
+    clientSocket.userName =
+      requestUrl.searchParams.get("userName") || `user ${clientSocket.userId}`;
+    if (
+      clientSocket.userId <= 0 ||
+      !Number.isSafeInteger(clientSocket.userId)
+    ) {
+      return clientSocket.close(1008, "Invalid userId");
     }
-    const connections = clients.get(socket.user_id) || new Set<WebSocket>();
-    connections.add(socket);
-    clients.set(socket.user_id, connections);
-    socket.rooms = new Set<number>();
-    socket.send(
-      answerFromServer({
+    const userSockets =
+      userConnections.get(clientSocket.userId) || new Set<WebSocket>();
+    userSockets.add(clientSocket);
+    userConnections.set(clientSocket.userId, userSockets);
+    clientSocket.joinedRoomIds = new Set<number>();
+    clientSocket.send(
+      serializeServerResponse({
         type: "SUCCESS",
         message: "Welcome to WebSocket Server!",
       }),
     );
-    addToRoom(socket, 1);
+    joinRoom(clientSocket, 1);
     console.log("client connected");
-    socket.on("message", (data) => {
+    clientSocket.on("message", (data) => {
       try {
         const message: ClientMessage = JSON.parse(data.toString());
-        const validatedMessage = validateData(message);
+        const validatedMessage = validateClientMessage(message);
         if (!validatedMessage) {
-          socket.send(
-            answerFromServer({
+          clientSocket.send(
+            serializeServerResponse({
               type: "ERROR",
               message: "wrong type message",
             }),
@@ -54,193 +65,298 @@ wss.on("connection", (socket: ExtendedWebSocket, request) => {
           return;
         }
         if (validatedMessage.type === "PRIVATE_MESSAGE") {
-          const reciever = clients.get(validatedMessage.to);
-          if (!reciever) {
-            socket.send(
-              answerFromServer({
+          const messageDeduplicationKey = `userId:${clientSocket.userId}-${validatedMessage.messageId}`;
+          const privateChannelId = `private:${[
+            clientSocket.userId,
+            validatedMessage.recipientId,
+          ]
+            .sort((a, b) => a - b)
+            .join(":")}`;
+          let messageSequence: number;
+          const messageSequenceId = `${clientSocket.userId}:${validatedMessage.messageId}`;
+          if (processedMessageIds.has(messageDeduplicationKey)) {
+            messageSequence = messageSequences.get(messageSequenceId) as number;
+            clientSocket.send(
+              serializeServerResponse({
+                type: "MESSAGE_ACK",
+                messageId: validatedMessage.messageId,
+                status: "ACCEPTED",
+                chatId: privateChannelId,
+                sequenceNumber: messageSequence,
+              }),
+            );
+            return;
+          }
+          const recipientSockets = userConnections.get(
+            validatedMessage.recipientId,
+          );
+          if (!recipientSockets) {
+            clientSocket.send(
+              serializeServerResponse({
                 type: "ERROR",
                 message: "Recipient is offline",
               }),
             );
             return;
           }
-          reciever.forEach((client) => {
-            if (client.readyState !== WebSocket.OPEN) {
+          if (messageSequences.has(messageSequenceId)) {
+            messageSequence = messageSequences.get(messageSequenceId) as number;
+          } else if (!chatSequences.has(privateChannelId)) {
+            messageSequence = 1;
+            chatSequences.set(privateChannelId, messageSequence);
+            messageSequences.set(messageSequenceId, messageSequence);
+          } else {
+            messageSequence =
+              (chatSequences.get(privateChannelId) as number) + 1;
+            messageSequences.set(messageSequenceId, messageSequence);
+            chatSequences.set(privateChannelId, messageSequence);
+          }
+          recipientSockets.forEach((connection) => {
+            if (connection.readyState !== WebSocket.OPEN) {
               return;
             }
-            client.send(
-              serverEventResponse({
+            connection.send(
+              serializeServerEvent({
                 type: "PRIVATE_MESSAGE_RECEIVED",
                 messageId: validatedMessage.messageId,
-                from: socket.user_id,
+                senderId: clientSocket.userId,
                 message: validatedMessage.message,
+                senderName:
+                  validatedMessage.senderName || `${clientSocket.userName}`,
+                sequenceNumber: messageSequence,
+                chatId: privateChannelId,
               }),
             );
           });
-          socket.send(
-            answerFromServer({
+          processedMessageIds.add(messageDeduplicationKey);
+          const messageTrackingKey = `userId:${validatedMessage.recipientId}-${validatedMessage.messageId}`;
+          privateMessageRecords.set(messageTrackingKey, {
+            senderId: clientSocket.userId,
+            recipientId: validatedMessage.recipientId,
+            messageId: validatedMessage.messageId,
+          });
+          clientSocket.send(
+            serializeServerResponse({
               type: "MESSAGE_ACK",
               messageId: validatedMessage.messageId,
               status: "ACCEPTED",
+              chatId: privateChannelId,
+              sequenceNumber: messageSequence,
             }),
           );
           return;
         } else if (validatedMessage.type === "JOIN_ROOM") {
-          const room_id = Number(validatedMessage.roomId);
+          const roomId = Number(validatedMessage.roomId);
           if (
-            Number.isNaN(room_id) ||
-            !Number.isSafeInteger(room_id) ||
-            room_id <= 0
+            Number.isNaN(roomId) ||
+            !Number.isSafeInteger(roomId) ||
+            roomId <= 0
           ) {
-            return socket.send(
-              answerFromServer({
+            return clientSocket.send(
+              serializeServerResponse({
                 type: "ERROR",
                 message: "Wrong type message",
               }),
             );
-          } else if (socket.rooms.has(room_id)) {
-            return socket.send(
-              answerFromServer({
+          } else if (clientSocket.joinedRoomIds.has(roomId)) {
+            return clientSocket.send(
+              serializeServerResponse({
                 type: "ERROR",
                 message: "You are already in this room",
               }),
             );
           }
-          return addToRoom(socket, room_id);
+          return joinRoom(clientSocket, roomId);
         } else if (validatedMessage.type === "LEAVE_ROOM") {
-          const room_id = Number(validatedMessage.roomId);
+          const roomId = Number(validatedMessage.roomId);
           if (
-            Number.isNaN(room_id) ||
-            !Number.isSafeInteger(room_id) ||
-            room_id <= 0
+            Number.isNaN(roomId) ||
+            !Number.isSafeInteger(roomId) ||
+            roomId <= 0
           ) {
-            return socket.send(
-              answerFromServer({
+            return clientSocket.send(
+              serializeServerResponse({
                 type: "ERROR",
                 message: "Wrong type message",
               }),
             );
-          } else if (!socket.rooms.has(room_id)) {
-            return socket.send(
-              answerFromServer({
+          } else if (!clientSocket.joinedRoomIds.has(roomId)) {
+            return clientSocket.send(
+              serializeServerResponse({
                 type: "ERROR",
                 message: "You are not in this room",
               }),
             );
           }
-          const roommates = rooms.get(room_id);
-          if (!roommates) {
+          const roomMemberIds = roomMembers.get(roomId);
+          if (!roomMemberIds) {
             return;
           }
-          socket.rooms.delete(room_id);
-          const hasOtherConnections = [...connections].some((connection) =>
-            (connection as ExtendedWebSocket).rooms.has(room_id),
+          clientSocket.joinedRoomIds.delete(roomId);
+          const hasOtherRoomConnections = [...userSockets].some((connection) =>
+            (connection as UserWebSocket).joinedRoomIds.has(roomId),
           );
-          if (!hasOtherConnections) {
-            roommates.delete(socket.user_id);
+          if (!hasOtherRoomConnections) {
+            roomMemberIds.delete(clientSocket.userId);
           }
-          if (roommates.size === 0) {
-            rooms.delete(room_id);
+          if (roomMemberIds.size === 0) {
+            roomMembers.delete(roomId);
           }
-          socket.send(
-            answerFromServer({
+          clientSocket.send(
+            serializeServerResponse({
               type: "SUCCESS",
-              message: "you left room " + room_id,
+              message: "you left room " + roomId,
             }),
           );
           return;
+        } else if (validatedMessage.type === "DELIVERED_ACK") {
+          const messageTrackingKey = `userId:${validatedMessage.senderId}-${validatedMessage.messageId}`;
+          const messageRecord = privateMessageRecords.get(messageTrackingKey);
+          if (!messageRecord) return;
+          const deliveryNotification: ServerResponse = {
+            type: "MESSAGE_DELIVERED",
+            messageId: messageRecord.messageId,
+            recipientId: messageRecord.recipientId,
+          };
+          if (clientSocket.userId !== messageRecord.recipientId) return;
+          userConnections.get(messageRecord.senderId)?.forEach((client) => {
+            if (client.readyState !== WebSocket.OPEN) return;
+            client.send(serializeServerResponse(deliveryNotification));
+          });
+          return;
         }
-        if (!socket.rooms.has(validatedMessage.room)) {
-          return socket.send(
-            answerFromServer({
+        if (!clientSocket.joinedRoomIds.has(validatedMessage.roomId)) {
+          return clientSocket.send(
+            serializeServerResponse({
               type: "ERROR",
               message: "You dont have access to this room",
             }),
           );
         }
-        const roommates = rooms.get(validatedMessage.room);
-        if (!roommates) {
-          return socket.send(
-            answerFromServer({ type: "ERROR", message: "room doesnt exist" }),
+        const publicChannelId = `room${validatedMessage.roomId}`;
+        let messageSequence: number;
+        const messageSequenceId = `${clientSocket.userId}:${validatedMessage.messageId}`;
+        const messageDeduplicationKey = `userId:${clientSocket.userId}-${validatedMessage.messageId}`;
+        if (processedMessageIds.has(messageDeduplicationKey)) {
+          messageSequence = messageSequences.get(messageSequenceId) as number;
+          clientSocket.send(
+            serializeServerResponse({
+              type: "MESSAGE_ACK",
+              messageId: validatedMessage.messageId,
+              status: "ACCEPTED",
+              chatId: publicChannelId,
+              sequenceNumber: messageSequence,
+            }),
+          );
+          return;
+        }
+        const roomMemberIds = roomMembers.get(validatedMessage.roomId);
+        if (!roomMemberIds) {
+          return clientSocket.send(
+            serializeServerResponse({
+              type: "ERROR",
+              message: "room doesnt exist",
+            }),
           );
         }
-        roommates.forEach((roommate) => {
-          const clientAccounts = clients.get(roommate);
-          if (!clientAccounts) {
-            return socket.send(
-              answerFromServer({
+        if (messageSequences.has(messageSequenceId)) {
+          messageSequence = messageSequences.get(messageSequenceId) as number;
+        } else if (!chatSequences.has(publicChannelId)) {
+          messageSequence = 1;
+          chatSequences.set(publicChannelId, messageSequence);
+          messageSequences.set(messageSequenceId, messageSequence);
+        } else {
+          messageSequence = (chatSequences.get(publicChannelId) as number) + 1;
+          messageSequences.set(messageSequenceId, messageSequence);
+          chatSequences.set(publicChannelId, messageSequence);
+        }
+        roomMemberIds.forEach((memberId) => {
+          const memberSockets = userConnections.get(memberId);
+          if (!memberSockets) {
+            return clientSocket.send(
+              serializeServerResponse({
                 type: "ERROR",
                 message: "clients do not found",
               }),
             );
           }
-          clientAccounts.forEach((client) => {
-            const extendedClient = client as ExtendedWebSocket;
+          memberSockets.forEach((client) => {
+            const extendedSocket = client as UserWebSocket;
             if (
-              extendedClient.readyState !== WebSocket.OPEN ||
-              !extendedClient.rooms.has(validatedMessage.room)
+              extendedSocket.readyState !== WebSocket.OPEN ||
+              !extendedSocket.joinedRoomIds.has(validatedMessage.roomId)
             ) {
               return;
             }
             client.send(
-              serverEventResponse({
+              serializeServerEvent({
                 type: "PUBLIC_MESSAGE_RECEIVED",
                 messageId: validatedMessage.messageId,
-                from: socket.user_id,
-                room: validatedMessage.room,
+                senderId: clientSocket.userId,
+                roomId: validatedMessage.roomId,
                 message: validatedMessage.message,
+                senderName:
+                  validatedMessage.senderName || `${clientSocket.userName}`,
+                chatId: publicChannelId,
+                sequenceNumber: messageSequence,
               }),
             );
           });
         });
-        socket.send(
-          answerFromServer({
+        processedMessageIds.add(messageDeduplicationKey);
+        clientSocket.send(
+          serializeServerResponse({
             type: "MESSAGE_ACK",
             messageId: validatedMessage.messageId,
             status: "ACCEPTED",
+            chatId: publicChannelId,
+            sequenceNumber: messageSequence,
           }),
         );
       } catch (error) {
         console.log(error);
-        socket.send(
-          answerFromServer({ type: "ERROR", message: "wrong type message" }),
+        clientSocket.send(
+          serializeServerResponse({
+            type: "ERROR",
+            message: "wrong type message",
+          }),
         );
       }
     });
 
-    socket.on("close", (code, reason) => {
-      const client = socket as ExtendedWebSocket;
-      connections.delete(client);
-      for (const roomId of client.rooms) {
-        const roommates = rooms.get(roomId);
-        if (!roommates) continue;
+    clientSocket.on("close", (code, reason) => {
+      const client = clientSocket as UserWebSocket;
+      userSockets.delete(client);
+      for (const roomId of client.joinedRoomIds) {
+        const roomMemberIds = roomMembers.get(roomId);
+        if (!roomMemberIds) continue;
 
-        const hasOtherConnection = [...connections].some((connection) =>
-          (connection as ExtendedWebSocket).rooms.has(roomId),
+        const hasOtherRoomConnections = [...userSockets].some((connection) =>
+          (connection as UserWebSocket).joinedRoomIds.has(roomId),
         );
 
-        if (!hasOtherConnection) {
-          roommates.delete(socket.user_id);
+        if (!hasOtherRoomConnections) {
+          roomMemberIds.delete(clientSocket.userId);
 
-          if (roommates.size === 0) {
-            rooms.delete(roomId);
+          if (roomMemberIds.size === 0) {
+            roomMembers.delete(roomId);
           }
         }
       }
-      if (connections.size === 0) {
-        clients.delete(socket.user_id);
+      if (userSockets.size === 0) {
+        userConnections.delete(clientSocket.userId);
       }
     });
 
-    socket.on("error", (error) => {
+    clientSocket.on("error", (error) => {
       console.error("WebSocket error:", error);
     });
   }
 });
 
-const heartbeat = setInterval(() => {
-  wss.clients.forEach((socket) => {
-    const client = socket as ExtendedWebSocket;
+const heartbeatInterval = setInterval(() => {
+  webSocketServer.clients.forEach((socket) => {
+    const client = socket as UserWebSocket;
     if (client.isAlive === false) {
       return client.terminate();
     }
@@ -249,15 +365,15 @@ const heartbeat = setInterval(() => {
   });
 }, 30000);
 
-wss.on("listening", () => {
+webSocketServer.on("listening", () => {
   console.log(`Server started on port 3000`);
 });
 
-wss.on("close", () => {
-  clearInterval(heartbeat);
+webSocketServer.on("close", () => {
+  clearInterval(heartbeatInterval);
 });
 
-const validateData = (data: ClientMessage) => {
+const validateClientMessage = (data: ClientMessage) => {
   if (
     typeof data !== "object" ||
     data === null ||
@@ -269,7 +385,8 @@ const validateData = (data: ClientMessage) => {
     data.type !== "PRIVATE_MESSAGE" &&
     data.type !== "PUBLIC_MESSAGE" &&
     data.type !== "JOIN_ROOM" &&
-    data.type !== "LEAVE_ROOM"
+    data.type !== "LEAVE_ROOM" &&
+    data.type !== "DELIVERED_ACK"
   ) {
     return null;
   } else if (data.type === "JOIN_ROOM" || data.type === "LEAVE_ROOM") {
@@ -279,6 +396,14 @@ const validateData = (data: ClientMessage) => {
       return null;
     } else {
       return data;
+    }
+  } else if (data.type === "DELIVERED_ACK") {
+    if (typeof data.messageId !== "string") {
+      return null;
+    } else if (data.messageId.trim().length === 0) {
+      return null;
+    } else if (data.senderId <= 0 || !Number.isSafeInteger(data.senderId)) {
+      return null;
     }
   } else if (
     typeof data.message !== "string" ||
@@ -291,17 +416,20 @@ const validateData = (data: ClientMessage) => {
   ) {
     return null;
   } else if (data.type === "PRIVATE_MESSAGE") {
-    if (typeof data.to !== "number") {
+    if (typeof data.recipientId !== "number") {
       return null;
-    } else if (data.to < 1 || !Number.isSafeInteger(data.to)) {
+    } else if (
+      data.recipientId < 1 ||
+      !Number.isSafeInteger(data.recipientId)
+    ) {
       return null;
     } else {
       return data;
     }
   } else if (data.type === "PUBLIC_MESSAGE") {
-    if (typeof data.room !== "number") {
+    if (typeof data.roomId !== "number") {
       return null;
-    } else if (data.room < 1 || !Number.isSafeInteger(data.room)) {
+    } else if (data.roomId < 1 || !Number.isSafeInteger(data.roomId)) {
       return null;
     } else {
       return data;
@@ -310,24 +438,24 @@ const validateData = (data: ClientMessage) => {
   return data;
 };
 
-const addToRoom = (socket: ExtendedWebSocket, room_id: number): void => {
-  const roommates = rooms.get(room_id) || new Set<number>();
-  if (!rooms.has(room_id)) {
-    roommates.add(socket.user_id);
-    rooms.set(room_id, roommates);
-  } else if (!roommates.has(socket.user_id)) {
-    roommates.add(socket.user_id);
+const joinRoom = (socket: UserWebSocket, roomId: number): void => {
+  const roomMemberIds = roomMembers.get(roomId) || new Set<number>();
+  if (!roomMembers.has(roomId)) {
+    roomMemberIds.add(socket.userId);
+    roomMembers.set(roomId, roomMemberIds);
+  } else if (!roomMemberIds.has(socket.userId)) {
+    roomMemberIds.add(socket.userId);
   }
-  socket.rooms.add(room_id);
+  socket.joinedRoomIds.add(roomId);
   socket.send(
-    JSON.stringify({ type: "SUCCESS", message: "welcome to chat " + room_id }),
+    JSON.stringify({ type: "SUCCESS", message: "welcome to chat " + roomId }),
   );
 };
 
-const answerFromServer = (message: ServerResponse): string => {
+const serializeServerResponse = (message: ServerResponse): string => {
   return JSON.stringify(message);
 };
 
-const serverEventResponse = (message: ServerEvent): string => {
+const serializeServerEvent = (message: ServerEvent): string => {
   return JSON.stringify(message);
 };
