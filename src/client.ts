@@ -5,6 +5,7 @@ import type {
   IPendingMessage,
   ClientMessage,
   UserWebSocket,
+  ServerEvent,
 } from "./interfaces.js";
 
 import readline from "node:readline";
@@ -18,8 +19,8 @@ const rl = readline.createInterface({
 const serverUrl = new URL("ws://localhost:3000");
 
 const pendingAcknowledgments = new Map<string, IPendingMessage>();
-const lastRecievedSequences = new Map<string, number>();
-const messageBuffer = new Map<string, Map<number, ServerMessage>>();
+const lastProcessedSequences = new Map<string, number>();
+const messageBuffer = new Map<string, Map<number, ServerEvent>>();
 
 const connectToServer = () => {
   const userId = Number(process.argv[2]);
@@ -70,65 +71,11 @@ const handleIncomingMessage = (data: RawData, client: UserWebSocket): void => {
           console.log(
             `${chalk.bgGreen(" SUCCESS ")} -> ${message.messageId}: ${message.status}`,
           );
-          const lastRecievedSequence =
-            lastRecievedSequences.get(message.chatId) ?? 0;
-          if (message.sequenceNumber === lastRecievedSequence + 1) {
-            lastRecievedSequences.set(message.chatId, message.sequenceNumber);
-            console.log(`${chalk.bgCyan(" INFO ")} -> MESSAGE IN ORDER`);
-          } else if (message.sequenceNumber > lastRecievedSequence + 1) {
-            console.log(`${chalk.bgCyan(" INFO ")} -> MISSING MESSAGE`);
-            const msgBuffer = messageBuffer.has(message.chatId)
-              ? messageBuffer.get(message.chatId)
-              : new Map<number, ServerMessage>();
-            if (!msgBuffer) return;
-            messageBuffer.set(message.chatId, msgBuffer);
-            msgBuffer.set(message.sequenceNumber, message);
-          } else if (message.sequenceNumber <= lastRecievedSequence) {
-            console.log(
-              `${chalk.bgCyan(" INFO ")} -> DUPLICATE OR OLD MESSAGE`,
-            );
-          }
         }
         break;
       case "PUBLIC_MESSAGE_RECEIVED":
-        console.log(
-          `${chalk.bgCyan(" PUBLIC ")} -> ${message.senderName}: ${message.message}`,
-        );
-        break;
-
       case "PRIVATE_MESSAGE_RECEIVED":
-        console.log("DEBUG MESSAGE:", {
-          chatId: message.chatId,
-          sequenceNumber: message.sequenceNumber,
-          messageId: message.messageId,
-        });
-        console.log(
-          `${chalk.bgMagenta(" PRIVATE ")} -> ${message.senderName}: ${message.message}`,
-        );
-        const deliveryAcknowledgment: ClientMessage = {
-          type: "DELIVERED_ACK",
-          messageId: message.messageId,
-          senderId: client.userId,
-        };
-        client.send(JSON.stringify(deliveryAcknowledgment));
-
-        const lastRecievedSequence =
-          lastRecievedSequences.get(message.chatId) ?? 0;
-        if (message.sequenceNumber === lastRecievedSequence + 1) {
-          lastRecievedSequences.set(message.chatId, message.sequenceNumber);
-          console.log(`${chalk.bgCyan(" INFO ")} -> MESSAGE IN ORDER`);
-        } else if (message.sequenceNumber > lastRecievedSequence + 1) {
-          console.log(`${chalk.bgCyan(" INFO ")} -> MISSING MESSAGE`);
-          const msgBuffer = messageBuffer.has(message.chatId)
-            ? messageBuffer.get(message.chatId)
-            : new Map<number, ServerMessage>();
-          if (!msgBuffer) return;
-          messageBuffer.set(message.chatId, msgBuffer);
-          msgBuffer.set(message.sequenceNumber, message);
-        } else if (message.sequenceNumber <= lastRecievedSequence) {
-          console.log(`${chalk.bgCyan(" INFO ")} -> DUPLICATE OR OLD MESSAGE`);
-        }
-
+        processMessageInOrder(message, client);
         break;
 
       case "MESSAGE_DELIVERED":
@@ -325,4 +272,82 @@ const validateClientMessage = (message: string): ClientMessage | null => {
     };
   }
   return null;
+};
+
+const processMessageInOrder = (
+  message: ServerEvent,
+  client: UserWebSocket,
+): void => {
+  const { chatId, sequenceNumber } = message;
+  const lastProcessedSequence = lastProcessedSequences.get(chatId) ?? 0;
+  const expectedSequence = lastProcessedSequence + 1;
+  // Старе або повторне повідомлення
+  if (sequenceNumber < expectedSequence) {
+    console.log("DUBLICATE OR OLD MESSAGE");
+    return;
+  }
+  // Повідомлення прийшло раніше за попередні
+  if (sequenceNumber > expectedSequence) {
+    let chatBuffer = messageBuffer.get(chatId);
+    if (!chatBuffer) {
+      chatBuffer = new Map<number, ServerEvent>();
+      messageBuffer.set(chatId, chatBuffer);
+    }
+    chatBuffer.set(sequenceNumber, message);
+    console.log(`MISSING MESSAGE: expected ${expectedSequence}`);
+    return;
+  }
+
+  // Повідомлення прийшло в правильному порядку
+  processRecievedMessage(message, client);
+
+  lastProcessedSequences.set(chatId, sequenceNumber);
+
+  const chatBuffer = messageBuffer.get(chatId);
+
+  if (!chatBuffer) return;
+
+  let nextSequence = sequenceNumber + 1;
+
+  while (chatBuffer.has(nextSequence)) {
+    const bufferedMessage = chatBuffer.get(nextSequence);
+    if (!bufferedMessage) break;
+    processRecievedMessage(message, client);
+    lastProcessedSequences.set(chatId, nextSequence);
+    chatBuffer.delete(nextSequence);
+    nextSequence++;
+  }
+  if (chatBuffer.size === 0) {
+    messageBuffer.delete(chatId);
+  }
+};
+
+const processRecievedMessage = (
+  message: ServerEvent,
+  client: UserWebSocket,
+): void => {
+  switch (message.type) {
+    case "PRIVATE_MESSAGE_RECEIVED":
+      console.log("DEBUG MESSAGE:", {
+        chatId: message.chatId,
+        sequenceNumber: message.sequenceNumber,
+        messageId: message.messageId,
+      });
+      console.log(
+        `${chalk.bgMagenta(" PRIVATE ")} -> ${message.senderName}: ${message.message}`,
+      );
+      const deliveryAcknowledgment: ClientMessage = {
+        type: "DELIVERED_ACK",
+        messageId: message.messageId,
+        senderId: client.userId,
+      };
+      client.send(JSON.stringify(deliveryAcknowledgment));
+      break;
+
+    case "PUBLIC_MESSAGE_RECEIVED":
+      console.log(
+        `${chalk.bgCyan(" PUBLIC ")} -> ${message.senderName}: ${message.message}`,
+      );
+      break;
+  }
 };

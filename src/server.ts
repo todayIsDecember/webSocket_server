@@ -5,7 +5,6 @@ import type {
   ServerResponse,
   ServerEvent,
   PrivateMessageRecord,
-  MessageStorage,
 } from "./interfaces.js";
 
 const webSocketServer = new WebSocketServer({ port: 3000 });
@@ -15,6 +14,32 @@ const processedMessageIds = new Set<string>();
 const privateMessageRecords = new Map<string, PrivateMessageRecord>();
 const chatSequences = new Map<string, number>();
 const messageSequences = new Map<string, number>();
+
+const handleClientMessage = (
+  client: UserWebSocket,
+  message: ClientMessage,
+): void => {
+  switch (message.type) {
+    case "PRIVATE_MESSAGE":
+      break;
+    case "PUBLIC_MESSAGE":
+      break;
+    case "JOIN_ROOM":
+      break;
+    case "LEAVE_ROOM":
+      break;
+    case "DELIVERED_ACK":
+      break;
+  }
+};
+
+const handlerPrivateMessage = (
+  client: UserWebSocket,
+  message: Extract<ClientMessage, { type: "PRIVATE_MESSAGE" }>,
+) => {
+  const messageDeduplicationKey = `userId:${client.userId}-${message.messageId}`;
+  const privateChannelId = `private:${[client.userId, message.recipientId].sort((a, b) => a - b).join(":")}`;
+};
 
 webSocketServer.on("connection", (clientSocket: UserWebSocket, request) => {
   if (!request.url) {
